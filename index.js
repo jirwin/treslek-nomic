@@ -1,6 +1,7 @@
 var redis = require('redis');
 var sprintf = require('sprintf').sprintf;
 var GitHubApi = require('github4');
+var request = require('request');
 
 var redisClient = null;
 var github = null;
@@ -10,9 +11,8 @@ var NOMIC_REPO = process.env.TRESLEK_NOMIC_REPO;
 var NOMIC_USER = process.env.TRESLEK_NOMIC_USER;
 var NOMIC_CHANNEL = process.env.TRESLEK_NOMIC_CHANNEL;
 
-console.log(NOMIC_ORG);
 var Nomic = function() {
-  this.commands = ['players'];
+  this.commands = ['nomic-players', 'nomic-score'];
   this.unload = ['endRedis'];
   this.auto = ['listen'];
   this.usage = {};
@@ -25,7 +25,44 @@ Nomic.prototype.endRedis = function(callback) {
   callback();
 };
 
-Nomic.prototype.players = function(bot, to, from, msg, callback) {
+Nomic.prototype._parseScoreboard = function(callback) {
+  var scoreboardUrl = sprintf('https://raw.githubusercontent.com/%s/%s/master/SCOREBOARD.md', NOMIC_ORG, NOMIC_REPO);
+  var scores = {};
+  request.get(scoreboardUrl, function (error, response, body) {
+    if (error || response.statusCode != 200) {
+      callback(error);
+      return;
+    }
+    var playerScores = body.split('\n').filter(function (line) {
+      return line[0] === '@';
+    }).map(function (line) {
+      var score = line.split('|').map(function (item) {
+        return item.trim();
+      });
+      scores[score[0].slice(1)] = {
+        score: parseInt(score[1], 10)
+      };
+    });
+    callback(null, scores);
+  });
+};
+
+Nomic.prototype['nomic-score'] = function(bot, to, from, msg, callback) {
+  this._parseScoreboard(function(err, scores) {
+    if(err) {
+      bot.say('Error getting scores.');
+      callback();
+      return;
+    }
+
+    Object.keys(scores).forEach(function(player) {
+      bot.say(to, sprintf('%s: %s', player, scores[player].score));
+    });
+    callback();
+  });
+};
+
+Nomic.prototype['nomic-players'] = function(bot, to, from, msg, callback) {
   var players = [NOMIC_ORG];
 
   function getForks(err, res) {
@@ -116,7 +153,7 @@ Nomic.prototype.listen = function(bot) {
       } else if (data.action === "closed") {
         output = sprintf("PR %s closed by %s", data.number, data.pull_request.merged_by.login);
       }
-      
+
       if (output) {
         bot.say(NOMIC_CHANNEL, output);
       }
