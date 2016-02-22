@@ -1,7 +1,11 @@
+var path = require('path');
+var fs = require('fs');
+
 var redis = require('redis');
 var sprintf = require('sprintf').sprintf;
 var GitHubApi = require('github4');
 var request = require('request');
+var handlebars = require('handlebars');
 
 var redisClient = null;
 var github = null;
@@ -10,6 +14,17 @@ var NOMIC_ORG = process.env.TRESLEK_NOMIC_ORG;
 var NOMIC_REPO = process.env.TRESLEK_NOMIC_REPO;
 var NOMIC_USER = process.env.TRESLEK_NOMIC_USER;
 var NOMIC_CHANNEL = process.env.TRESLEK_NOMIC_CHANNEL;
+var NOMIC_REPO_PATH = process.env.TRESLEK_NOMIC_REPO_PATH;
+
+function loadTemplate(template, callback) {
+  fs.readFile(path.join(__dirname, 'templates', template), function(err, file) {
+    if (err) {
+      throw err;
+    }
+
+    callback(null, handlebars.compile(file.toString()));
+  });
+}
 
 var Nomic = function() {
   this.commands = ['nomic-players', 'nomic-score'];
@@ -33,7 +48,7 @@ Nomic.prototype._parseScoreboard = function(callback) {
       callback(error);
       return;
     }
-    var playerScores = body.split('\n').filter(function (line) {
+    body.split('\n').filter(function (line) {
       return line[0] === '@';
     }).map(function (line) {
       var score = line.split('|').map(function (item) {
@@ -44,6 +59,29 @@ Nomic.prototype._parseScoreboard = function(callback) {
       };
     });
     callback(null, scores);
+  });
+};
+
+Nomic.prototype._writeScoreboard = function(scores, callback) {
+  loadTemplate('scoreboard.tmpl', function(err, template) {
+    if (err) {
+      callback(err);
+      return;
+    }
+
+    var outputScores = Object.keys(scores).map(function(player) {
+      return {
+        name: player,
+        score: scores[player].score
+      }
+    }).sort(function(a, b) {
+      return b.score - a.score;
+    });
+
+    fs.writeFile(path.join(NOMIC_REPO_PATH, 'SCOREBOARD.md'), template({scores: outputScores}), function (err) {
+      if (err) throw err;
+    });
+    callback();
   });
 };
 

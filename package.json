@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/jirwin/treslek-nomic#readme",
   "dependencies": {
-    "github4": "^0.5.3"
+    "github4": "^0.5.3",
+    "handlebars": "^4.0.5"
   }
 }
