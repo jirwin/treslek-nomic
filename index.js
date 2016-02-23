@@ -1,12 +1,14 @@
 var path = require('path');
 var fs = require('fs');
 
+var async = require('async');
 var redis = require('redis');
 var sprintf = require('sprintf').sprintf;
 var GitHubApi = require('github4');
 var request = require('request');
 var handlebars = require('handlebars');
 
+var subRedisClient = null;
 var redisClient = null;
 var github = null;
 
@@ -15,6 +17,7 @@ var NOMIC_REPO = process.env.TRESLEK_NOMIC_REPO;
 var NOMIC_USER = process.env.TRESLEK_NOMIC_USER;
 var NOMIC_CHANNEL = process.env.TRESLEK_NOMIC_CHANNEL;
 var NOMIC_REPO_PATH = process.env.TRESLEK_NOMIC_REPO_PATH;
+var NOMIC_PLAYER_BLACKLIST = process.env.TRESLEK_NOMIC_PLAYER_BLACKLIST.split(',');
 
 function loadTemplate(template, callback) {
   fs.readFile(path.join(__dirname, 'templates', template), function(err, file) {
@@ -34,7 +37,9 @@ var Nomic = function() {
 };
 
 Nomic.prototype.endRedis = function(callback) {
-  redisClient.end();
+  subRedisClient.end();
+  subRedisClient = null;
+  redisClient.quit();
   redisClient = null;
   github = null;
   callback();
@@ -100,7 +105,7 @@ Nomic.prototype['nomic-score'] = function(bot, to, from, msg, callback) {
   });
 };
 
-Nomic.prototype['nomic-players'] = function(bot, to, from, msg, callback) {
+Nomic.prototype._getActivePlayers = function(callback) {
   var players = [NOMIC_ORG];
 
   function getForks(err, res) {
@@ -111,17 +116,21 @@ Nomic.prototype['nomic-players'] = function(bot, to, from, msg, callback) {
     }
 
     players = players.concat(res.map(function (fork) {
-      return fork.owner.login;
+      if (NOMIC_PLAYER_BLACKLIST.indexOf(fork.owner.login) === -1) {
+        return fork.owner.login;
+      } else {
+        return false;
+      }
+    }).filter(function(player) {
+      return player;
     }));
 
     if (github.hasNextPage(res)) {
       github.getNextPage(res, getForks);
     } else {
-      bot.say(to, "The current players are: " + players.join(', '));
-      callback();
+      callback(null, players);
     }
   }
-
   github.repos.getForks({
     user: NOMIC_ORG,
     repo: NOMIC_REPO,
@@ -129,30 +138,60 @@ Nomic.prototype['nomic-players'] = function(bot, to, from, msg, callback) {
   }, getForks);
 };
 
+Nomic.prototype['nomic-players'] = function(bot, to, from, msg, callback) {
+  this._getActivePlayers(function(err, players) {
+    if (err) {
+      bot.say(to, "Unable to retrieve players.");
+      callback();
+      return;
+    }
 
-Nomic.prototype.commentCreated = function(data) {
-  var plusOne = /^:\+1:$|^\+1$|^-1$/,
+    bot.say(to, players.join(', '));
+    callback();
+  });
+};
+
+Nomic.prototype._handleVote = function(player, pr, vote) {
+  var voteStore = sprintf("%s:%s:nomic:%s", NOMIC_ORG, NOMIC_REPO, pr);
+
+  redisClient.zadd(voteStore, vote, player, function(err, callback) {
+    console.log('added vote!');
+    if (err) {
+      console.error('Unable to register vote by player:' + player);
+      return;
+    }
+
+    console.log(sprintf('Successfully registered vote by player %s on %s'), player, pr);
+  });
+};
+
+Nomic.prototype.commentCreated = function(bot, data) {
+  var plusOne = /^:\+1:$|^\+1$|^-1$|^:-1:$/,
       vote = /([\+-]1)/,
       matches = [];
 
-  if (plusOne.test(data.comment.body)) {
+  if (plusOne.test(data.comment.body.trim())) {
     matches = data.comment.body.match(vote);
     if (!matches) {
       return;
     }
 
-    return sprintf("%s voted %s on %s - %s", data.comment.user.login, matches[0], data.issue.title, data.issue.html_url);
-  }
+    this._handleVote(data.comment.user.login, data.issue.number, matches[0]);
 
-  return false;
+    bot.say(NOMIC_CHANNEL, sprintf("%s voted %s on %s - %s", data.comment.user.login, matches[0], data.issue.title, data.issue.html_url));
+  }
 };
 
 Nomic.prototype.listen = function(bot) {
+  if (!subRedisClient) {
+    subRedisClient = redis.createClient(bot.redisConf.port, bot.redisConf.host);
+    subRedisClient.auth(bot.redisConf.pass, function() {});
+  }
   if (!redisClient) {
     redisClient = redis.createClient(bot.redisConf.port, bot.redisConf.host);
     redisClient.auth(bot.redisConf.pass, function() {});
   }
-  console.log('Loading github');
+
   if (!github) {
     github = new GitHubApi({
       version: "3.0.0",
@@ -174,17 +213,24 @@ Nomic.prototype.listen = function(bot) {
   var pattern = [bot.redisConf.prefix, 'webhookChannels:treslek-nomic'].join(':'),
       self = this;
 
-  redisClient.on("message", function(channel, message) {
+  subRedisClient.on("message", function(channel, message) {
     message = message.toString();
     var data = JSON.parse(JSON.parse(message).body),
         output;
 
     if (data) {
-      if (data.action === "created") {
-        if (data.comment) {
-          output = self.commentCreated(data);
-        }
+      if (data.action === "created" && data.comment && data.issue.state === "open" && data.issue.user.login !== data.comment.user.login) {
+        self._getActivePlayers(function(err, players) {
+          if (players.indexOf(data.comment.user.login) !== -1) {
+            self.commentCreated(bot, data);
+          }
+        });
       } else if (data.action === "opened") {
+        self._getActivePlayers(function(err, players) {
+          if (players.indexOf(data.pull_request.user.login !== -1)) {
+           self._handleVote(data.pull_request.user.login, data.pull_request.number, 1);
+          }
+        });
         output = sprintf("New PR \"%s\" by %s at %s",
           data.pull_request.title, data.pull_request.user.login,
           data.pull_request.html_url, data.pull_request.body);
@@ -197,7 +243,7 @@ Nomic.prototype.listen = function(bot) {
       }
     }
   });
-  redisClient.subscribe(pattern);
+  subRedisClient.subscribe(pattern);
 };
 
 exports.Plugin = Nomic;
